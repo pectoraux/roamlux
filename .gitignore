@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# next.js
+.next/
+out/
+build/
+dist/
+
+# env (secrets — never commit)
+.env
+.env.local
+.env.*.local
+.env.production
+
+# database
+db/
+*.db
+*.db-journal
+
+# logs
+*.log
+dev.log
+server.log
+
+# sandbox / process artifacts — never commit
+*.pid
+.zscripts/
+redeploy-watcher.log
+
+# misc
+.DS_Store
+*.pem
+.vscode/
+.idea/
+coverage/
+.turbo/
+
+# vercel
+.vercel
+quota-watcher.sh
+redeploy.sh

@@ -1,0 +1,547 @@
+// RoamLink — Connectivity Operating System
+// Prisma schema (PostgreSQL / Neon). Domain layers are structurally separated:
+// Identity | Waitlist | Protocol | Kernel | ControlPlane | Adapters | Audit | Events
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  PLATFORM_ADMIN
+  CONSUMER
+  FAMILY_ADMIN
+  ENTERPRISE_ADMIN
+  PROVIDER
+  RESELLER
+  OPERATIONS
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+  SUSPENDED
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String?
+  role          Role     @default(CONSUMER)
+  status        UserStatus @default(ACTIVE)
+  isDemo        Boolean  @default(false) // seeded demo identity — never a privilege
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  disabledAt    DateTime?
+  disabledReason String?
+
+  accounts      Account[]
+  sessions      Session[]
+  waitlistEntry WaitlistEntry?
+  intents       ConnectivityIntent[]
+  sessionsOwned ConnectivitySession[]
+  auditActions  AuditLog[]
+  decisions     Decision[]
+
+  @@index([role, status])
+}
+
+// NextAuth.js models (Credentials provider in use; these keep the contract standard)
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WAITLIST  (public signup does NOT create a user; it creates a WaitlistEntry)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum WaitlistStatus {
+  PENDING
+  INVITED
+  APPROVED
+  REJECTED
+  CONVERTED
+}
+
+model WaitlistEntry {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  name          String?
+  requestedRole Role           @default(CONSUMER)
+  status        WaitlistStatus @default(PENDING)
+  source        String         @default("public_signup")
+  notes         String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  decidedAt     DateTime?
+  decidedBy     String?
+  convertedUserId String? @unique
+  user          User?           @relation(fields: [convertedUserId], references: [id])
+
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROTOCOL  (distinct domain concepts — never collapsed into "Product")
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Intent = what the consumer wants. Intent does NOT choose the provider.
+model ConnectivityIntent {
+  id          String   @id @default(cuid())
+  subjectId   String
+  capability  String   // e.g. "internet", "wifi", "lte", "esim_data"
+  location    Json     // { country, region, lat?, lng? }
+  timeWindow  Json     // { start, end, tz }
+  usage       Json     // { downlinkMbps?, uplinkMbps?, dataGB? }
+  constraints Json     @default("{}") // { maxLatencyMs, minReliability }
+  preferences Json     @default("{}") // { prioritize: "cost"|"quality"|"reliability" }
+  policy      Json?    // optional inline policy override
+  createdAt   DateTime @default(now())
+  subject     User     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+  sessions    ConnectivitySession[]
+  decisions   Decision[]
+
+  @@index([subjectId])
+}
+
+// Capability = what a provider/resource can technically provide. NOT a commercial offer.
+model Capability {
+  id           String   @id @default(cuid())
+  providerId   String
+  type         String   // "wifi" | "lte" | "esim_data" | "isp" | "satellite" | "shared_bw"
+  coverage     Json     // { countries: [], regions: [] }
+  advertised   Json     // { maxDownlinkMbps, maxUplinkMbps, typicalLatencyMs, reliability }
+  validFrom    DateTime @default(now())
+  validUntil   DateTime?
+  published    Boolean  @default(true)
+  resources    Resource[]
+  offers       Offer[]
+  provider     Provider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId, published])
+}
+
+// Resource = the actual consumable/controllable thing (hotspot session, SIM profile, data package, router...).
+model Resource {
+  id            String   @id @default(cuid())
+  providerId    String
+  capabilityId  String
+  identifier    String   // provider-native resource id
+  state         String   @default("available") // available | reserved | active | released | expired | failed
+  attributes    Json     @default("{}") // { quotaGB, maxConcurrent, geoLock }
+  createdAt     DateTime @default(now())
+  capability    Capability @relation(fields: [capabilityId], references: [id])
+  provider      Provider   @relation(fields: [providerId], references: [id])
+  offers        Offer[]
+  reservations  Reservation[]
+  sessions      ConnectivitySession[]
+
+  @@index([providerId, state])
+}
+
+// Offer = commercial terms over a capability/resource. One capability → many offers.
+model Offer {
+  id            String   @id @default(cuid())
+  capabilityId  String
+  resourceId    String?
+  providerId    String
+  name          String
+  currency      String   @default("USD")
+  priceCents    Int
+  unit          String   @default("flat") // flat | per_gb | per_hour | per_day
+  billingModel  Json     @default("{}") // { activationFeeCents?, overageCentsPerGb? }
+  valid         Boolean  @default(true)
+  capability    Capability @relation(fields: [capabilityId], references: [id])
+  resource      Resource?  @relation(fields: [resourceId], references: [id])
+  provider      Provider   @relation(fields: [providerId], references: [id])
+  entitlements  Entitlement[]
+
+  @@index([providerId, valid])
+}
+
+// Entitlement = the consumer's RIGHT to consume. May originate from purchase, allocation, promotion, etc.
+enum EntitlementOrigin {
+  PURCHASE
+  SUBSCRIPTION
+  COMPANY_ALLOCATION
+  FAMILY_TRANSFER
+  PROMOTION
+  SPONSORSHIP
+  TRIAL
+}
+
+model Entitlement {
+  id          String           @id @default(cuid())
+  subjectId   String
+  offerId     String?
+  origin      EntitlementOrigin
+  quota       Json             @default("{}") // { dataGB?, seconds?, sessions? }
+  validFrom   DateTime         @default(now())
+  validUntil  DateTime?
+  consumed    Json             @default("{}") // { dataGB, seconds, sessions }
+  active      Boolean          @default(true)
+  metadata    Json             @default("{}")
+  createdAt   DateTime         @default(now())
+  offer       Offer?           @relation(fields: [offerId], references: [id])
+  reservations Reservation[]
+
+  @@index([subjectId, active])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONNECTIVITY KERNEL  (Reservation + Session state machines)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ReservationState {
+  AVAILABLE
+  RESERVED
+  ACTIVE
+  RELEASED
+  EXPIRED
+  FAILED
+}
+
+model Reservation {
+  id            String           @id @default(cuid())
+  intentId      String
+  resourceId    String
+  entitlementId String?
+  state         ReservationState @default(RESERVED)
+  idempotencyKey String?  @unique
+  expiresAt     DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  failureReason String?
+  intent        ConnectivityIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+  resource      Resource           @relation(fields: [resourceId], references: [id])
+  entitlement   Entitlement?       @relation(fields: [entitlementId], references: [id])
+  session       ConnectivitySession?
+
+  @@index([intentId, state])
+}
+
+enum SessionState {
+  REQUESTED
+  PROVISIONING
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+  FAILED
+}
+
+model ConnectivitySession {
+  id              String       @id @default(cuid())
+  subjectId       String
+  deviceId        String?
+  resourceId      String
+  providerId      String
+  reservationId   String?  @unique
+  intentId        String?
+  state           SessionState @default(REQUESTED)
+  // FENCING: monotonically increasing generation. Each successful transition
+  // increments it. Stale operations capturing an old generation cannot overwrite
+  // newer state (optimistic concurrency control).
+  generation      Int          @default(1)
+  startedAt       DateTime?
+  endedAt         DateTime?
+  currentQuality  Json     @default("{}") // last observed snapshot
+  currentCostCents Int     @default(0)
+  policy          Json     @default("{}")
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  subject         User         @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  resource        Resource     @relation(fields: [resourceId], references: [id])
+  reservation     Reservation? @relation(fields: [reservationId], references: [id])
+  intent          ConnectivityIntent? @relation(fields: [intentId], references: [id])
+  transitions     SessionTransition[]
+  measurements    Measurement[]
+  operations      Operation[]
+
+  @@index([subjectId, state])
+  @@index([providerId, state])
+}
+
+model SessionTransition {
+  id        String   @id @default(cuid())
+  sessionId String
+  from      String
+  to        String
+  reason    String
+  actor     String   // user id or "system"
+  actionId  String?  // generic action that caused it
+  at        DateTime @default(now())
+  session   ConnectivitySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, at])
+}
+
+// Measurement = OBSERVED truth. Distinct from provider-advertised capability.
+model Measurement {
+  id          String   @id @default(cuid())
+  sessionId   String
+  latencyMs   Float?
+  downlinkMbps Float?
+  uplinkMbps  Float?
+  packetLossPct Float?
+  jitterMs    Float?
+  availabilityPct Float?
+  observedAt  DateTime @default(now())
+  source      String   @default("adapter")
+  session     ConnectivitySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, observedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTROL PLANE  (deterministic decision + policy)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum DecisionType {
+  SELECT
+  SWITCH
+  RETAIN
+  RELEASE
+}
+
+model Decision {
+  id            String       @id @default(cuid())
+  intentId      String
+  decisionType  DecisionType
+  fromSessionId String?
+  targetResourceId String?
+  targetProviderId String?
+  scoreCurrent  Float?
+  scoreTarget   Float?
+  switchingCost Float?
+  effectiveDelta Float?
+  reasonCodes   String[]     // ["LOWER_LATENCY","MEETS_POLICY",...]
+  policyMet     Boolean      @default(false)
+  createdAt     DateTime     @default(now())
+  decidedBy     String       @default("deterministic_engine")
+  // REPRODUCIBILITY: snapshots sufficient to explain WHY this decision was made.
+  // The future audit question "why did RoamLink make this decision?" is answerable
+  // from these stored snapshots without re-running the engine.
+  intentSnapshot    Json     @default("{}")  // the intent at evaluation time
+  policySnapshot    Json     @default("{}")  // the effective policy
+  candidateSnapshot Json     @default("[]")  // all scored candidates
+  measurementSnapshot Json   @default("{}")  // measurements used
+  weightsSnapshot   Json     @default("{}")  // scoring weights
+  evaluationTime    DateTime @default(now()) // deterministic clock input
+  intent        ConnectivityIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+  actor         User?        @relation(fields: [decidedBy], references: [id])
+
+  @@index([intentId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADAPTERS / PROVIDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ProviderType {
+  MOCK
+  MIKROTIK
+  ESIM
+}
+
+model Provider {
+  id          String       @id @default(cuid())
+  code        String       @unique // "MOCK_A" | "MOCK_B" | "MOCK_C"
+  name        String
+  type        ProviderType @default(MOCK)
+  supportedActions String[] // generic action vocabulary the adapter implements
+  config      Json         @default("{}") // non-secret adapter config
+  active      Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+
+  capabilities Capability[]
+  resources    Resource[]
+  offers       Offer[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIT  (important actions are auditable)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  actorId       String?
+  actorType     String   @default("user")
+  action        String   // "waitlist.approve" | "user.create" | "session.activate" ...
+  targetType    String?
+  targetId      String?
+  result        String   @default("success") // success | failure
+  reason        String?
+  correlationId String?
+  requestId     String?
+  metadata      Json     @default("{}")
+  at            DateTime @default(now())
+  actor         User?    @relation(fields: [actorId], references: [id])
+
+  @@index([action, at])
+  @@index([actorId, at])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EVENTS (outbox pattern — reliable domain event publication)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum EventStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model OutboxEvent {
+  id            String      @id @default(cuid())
+  type          String      // "WaitlistEntryCreated" | "SessionStarted" ...
+  aggregateType String?     // "waitlist" | "session" | "user" | "entitlement" ...
+  aggregateId   String?     // the entity id the event concerns
+  payload       Json
+  status        EventStatus @default(PENDING)
+  attempts      Int         @default(0)
+  lastAttemptAt DateTime?
+  lastError     String?
+  // LEASE: concurrent-safe claiming. A drainer atomically sets claimToken +
+  // claimedAt; another drainer sees the lease and skips. Lease expires after
+  // a timeout (stale claims are re-claimable).
+  claimToken    String?
+  claimedAt     DateTime?
+  createdAt     DateTime    @default(now())
+  publishedAt   DateTime?
+
+  @@index([status, createdAt])
+  @@index([aggregateType, aggregateId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPERATIONS — durable, idempotent externally-visible actions.
+// The same logical command (same idempotencyKey) can only create ONE operation.
+// State: PENDING → RUNNING → SUCCEEDED | FAILED.
+// Fencing: each operation captures the session generation at creation time;
+// a stale operation cannot overwrite a newer generation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OperationState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  TIMED_OUT
+}
+
+model Operation {
+  id              String         @id @default(cuid())
+  idempotencyKey  String         @unique
+  actionType      String         // ACTIVATE | DEACTIVATE | SWITCH | RESERVE | RELEASE | ...
+  subjectId       String
+  resourceId      String?
+  providerId      String?
+  sessionId       String?
+  // FENCING: the session generation captured when this operation was created.
+  // When applying results, if the session's current generation > operationGen,
+  // the operation is STALE and must not mutate state.
+  operationGen    Int            @default(1)
+  state           OperationState @default(PENDING)
+  requestPayload  Json           @default("{}")
+  responsePayload Json?
+  error           String?
+  createdAt       DateTime       @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  session         ConnectivitySession? @relation(fields: [sessionId], references: [id])
+
+  @@index([subjectId, actionType])
+  @@index([state, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROVIDER RESOURCE STATE — the provider's actual view of a resource.
+// Represents the RESOURCE, not a command. Keyed by (providerCode, resourceIdentifier).
+// This is what adapter.reconcile() queries to discover provider-side truth.
+// Separated from command idempotency (MockProviderCommand) per audit issue #6.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ProviderResourceState {
+  id                 String    @id @default(cuid())
+  providerCode       String
+  resourceIdentifier String
+  state              String    @default("inactive") // inactive | active | suspended
+  lastCommandKey     String?   // idempotency key of the last command that affected this
+  activatedAt        DateTime?
+  updatedAt          DateTime  @updatedAt
+  createdAt          DateTime  @default(now())
+
+  @@unique([providerCode, resourceIdentifier])
+  @@index([providerCode])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOCK PROVIDER COMMAND — adapter-level command idempotency log.
+// Records what command was attempted, its fault mode, and result.
+// This is COMMAND identity, not resource state. Per audit issue #6, these
+// two concepts are separated: resource state lives in ProviderResourceState.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MockProviderCommand {
+  id              String    @id @default(cuid())
+  idempotencyKey  String    @unique
+  providerCode    String
+  resourceIdentifier String
+  // Failure-injection mode for deterministic testing.
+  // SUCCESS | TIMEOUT | FAIL_BEFORE_SIDE_EFFECT | FAIL_AFTER_SIDE_EFFECT
+  // | DUPLICATE | STALE_STATE | SLOW_SUCCESS
+  faultMode       String    @default("SUCCESS")
+  // Result of the command: success | failure | timeout | pending
+  result          String    @default("pending")
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
+
+  @@index([providerCode, resourceIdentifier])
+}
