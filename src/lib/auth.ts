@@ -4,7 +4,7 @@ import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { db } from "@/lib/db";
 import { verifyPassword } from "@/lib/password";
-import type { Role } from "@prisma/client";
+import type { Role } from "@/domain/protocol";
 
 export const authOptions: NextAuthOptions = {
   session: { strategy: "jwt" },

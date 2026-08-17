@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requirePermission } from "@/lib/server-auth";
 import { audit } from "@/lib/audit";
-import type { Role } from "@prisma/client";
+import type { Role } from "@/domain/protocol";
 // GET /api/admin/users/:id — user detail
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const ctx = await requirePermission("user.view");

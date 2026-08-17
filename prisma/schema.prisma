@@ -230,6 +230,7 @@ model Entitlement {
   reservations Reservation[]
 
   @@index([subjectId, active])
+  @@index([subjectId, offerId, origin])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +283,10 @@ model ConnectivitySession {
   reservationId   String?  @unique
   intentId        String?
   state           SessionState @default(REQUESTED)
+  // FENCING: monotonically increasing generation. Each successful transition
+  // increments it. Stale operations capturing an old generation cannot overwrite
+  // newer state (optimistic concurrency control).
+  generation      Int          @default(1)
   startedAt       DateTime?
   endedAt         DateTime?
   currentQuality  Json     @default("{}") // last observed snapshot
@@ -297,6 +302,7 @@ model ConnectivitySession {
   intent          ConnectivityIntent? @relation(fields: [intentId], references: [id])
   transitions     SessionTransition[]
   measurements    Measurement[]
+  operations      Operation[]
 
   @@index([subjectId, state])
   @@index([providerId, state])
@@ -359,6 +365,15 @@ model Decision {
   policyMet     Boolean      @default(false)
   createdAt     DateTime     @default(now())
   decidedBy     String       @default("deterministic_engine")
+  // REPRODUCIBILITY: snapshots sufficient to explain WHY this decision was made.
+  // The future audit question "why did RoamLink make this decision?" is answerable
+  // from these stored snapshots without re-running the engine.
+  intentSnapshot    Json     @default("{}")  // the intent at evaluation time
+  policySnapshot    Json     @default("{}")  // the effective policy
+  candidateSnapshot Json     @default("[]")  // all scored candidates
+  measurementSnapshot Json   @default("{}")  // measurements used
+  weightsSnapshot   Json     @default("{}")  // scoring weights
+  evaluationTime    DateTime @default(now()) // deterministic clock input
   intent        ConnectivityIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
   actor         User?        @relation(fields: [decidedBy], references: [id])
 
@@ -373,6 +388,38 @@ enum ProviderType {
   MOCK
   MIKROTIK
   ESIM
+  COMMUNITY
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROVIDER CERTIFICATION — conformance testing lifecycle (M8).
+// A provider progresses through certification states before going active.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CertificationStatus {
+  REGISTERED
+  VERIFIED
+  CONFORMANCE_TESTED
+  CERTIFIED
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+model ProviderCertification {
+  id              String              @id @default(cuid())
+  providerCode    String
+  adapterType     String
+  contractVersion String
+  conformanceResult String            @default("pending") // pass | fail | pending
+  testedAt        DateTime?
+  status          CertificationStatus @default(REGISTERED)
+  failureSummary  String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@unique([providerCode, contractVersion])
+  @@index([status])
 }
 
 model Provider {
@@ -424,14 +471,163 @@ enum EventStatus {
 }
 
 model OutboxEvent {
-  id        String       @id @default(cuid())
-  type      String       // "WaitlistEntryCreated" | "SessionStarted" ...
-  payload   Json
-  status    EventStatus  @default(PENDING)
-  attempts  Int          @default(0)
-  lastError String?
-  createdAt DateTime     @default(now())
-  publishedAt DateTime?
+  id            String      @id @default(cuid())
+  type          String      // "WaitlistEntryCreated" | "SessionStarted" ...
+  aggregateType String?     // "waitlist" | "session" | "user" | "entitlement" ...
+  aggregateId   String?     // the entity id the event concerns
+  payload       Json
+  status        EventStatus @default(PENDING)
+  attempts      Int         @default(0)
+  lastAttemptAt DateTime?
+  lastError     String?
+  // LEASE: concurrent-safe claiming. A drainer atomically sets claimToken +
+  // claimedAt; another drainer sees the lease and skips. Lease expires after
+  // a timeout (stale claims are re-claimable).
+  claimToken    String?
+  claimedAt     DateTime?
+  createdAt     DateTime    @default(now())
+  publishedAt   DateTime?
 
   @@index([status, createdAt])
+  @@index([aggregateType, aggregateId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPERATIONS — durable, idempotent externally-visible actions.
+// The same logical command (same idempotencyKey) can only create ONE operation.
+// State: PENDING → RUNNING → SUCCEEDED | FAILED.
+// Fencing: each operation captures the session generation at creation time;
+// a stale operation cannot overwrite a newer generation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OperationState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  TIMED_OUT
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTIVATION REQUEST — API-level command idempotency (v4).
+// A durable client-supplied command key ties an activation request to exactly
+// one session lifecycle. The request is created AND linked to the session in
+// ONE transaction — there is no externally-visible state where the request
+// exists with sessionId=NULL that a concurrent caller could interpret as
+// permission to create another session.
+//
+//   ActivationRequest (client command key, status=CREATED)
+//        ↓
+//   Session (lifecycle)
+//        ↓
+//   Operation (adapter command)
+//
+// INVARIANTS (v4):
+//   - ONE requestKey = ONE ActivationRequest = ONE Session = ONE activation Operation
+//   - subjectId/intentId/resourceId/providerId/offerId are immutable after creation
+//   - A requestKey belonging to subject A is never usable by subject B
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ActivationRequestStatus {
+  PENDING   // legacy — not used in v8 (kept for migration compat)
+  CLAIMED   // Phase 1 complete: command accepted, entitlement/session not yet created
+  CREATED   // Phase 3 complete: session linked, activation in progress or complete
+  FAILED    // activation failed; the request is terminal (a new lifecycle needs a new requestKey)
+}
+
+model ActivationRequest {
+  id              String                 @id @default(cuid())
+  requestKey      String                 @unique
+  subjectId       String
+  intentId        String
+  resourceId      String
+  providerId      String
+  offerId         String?
+  sessionId       String?
+  status          ActivationRequestStatus @default(PENDING)
+  // Payload hash for conflict detection: if the same requestKey is reused with
+  // a different payload (different intent/resource/provider/offer/subject),
+  // the claim returns a deterministic conflict.
+  payloadHash     String                 @default("")
+  // LEASE (v9): a CLAIMED request has a lease that expires. If the holder
+  // crashes, the lease expires and another caller can reclaim. This prevents
+  // permanent tombstones. compare-and-set: UPDATE ... WHERE status='CLAIMED'
+  // AND claimExpiresAt < NOW().
+  claimToken      String?
+  claimExpiresAt  DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @default(now()) @updatedAt
+
+  @@index([subjectId, intentId])
+}
+
+model Operation {
+  id              String         @id @default(cuid())
+  idempotencyKey  String         @unique
+  actionType      String         // ACTIVATE | DEACTIVATE | SWITCH | RESERVE | RELEASE | ...
+  subjectId       String
+  resourceId      String?
+  providerId      String?
+  sessionId       String?
+  // FENCING: the session generation captured when this operation was created.
+  // When applying results, if the session's current generation > operationGen,
+  // the operation is STALE and must not mutate state.
+  operationGen    Int            @default(1)
+  state           OperationState @default(PENDING)
+  requestPayload  Json           @default("{}")
+  responsePayload Json?
+  error           String?
+  createdAt       DateTime       @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  session         ConnectivitySession? @relation(fields: [sessionId], references: [id])
+
+  @@index([subjectId, actionType])
+  @@index([state, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROVIDER RESOURCE STATE — the provider's actual view of a resource.
+// Represents the RESOURCE, not a command. Keyed by (providerCode, resourceIdentifier).
+// This is what adapter.reconcile() queries to discover provider-side truth.
+// Separated from command idempotency (MockProviderCommand) per audit issue #6.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ProviderResourceState {
+  id                 String    @id @default(cuid())
+  providerCode       String
+  resourceIdentifier String
+  state              String    @default("inactive") // inactive | active | suspended
+  lastCommandKey     String?   // idempotency key of the last command that affected this
+  activatedAt        DateTime?
+  updatedAt          DateTime  @updatedAt
+  createdAt          DateTime  @default(now())
+
+  @@unique([providerCode, resourceIdentifier])
+  @@index([providerCode])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOCK PROVIDER COMMAND — adapter-level command idempotency log.
+// Records what command was attempted, its fault mode, and result.
+// This is COMMAND identity, not resource state. Per audit issue #6, these
+// two concepts are separated: resource state lives in ProviderResourceState.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MockProviderCommand {
+  id              String    @id @default(cuid())
+  idempotencyKey  String    @unique
+  providerCode    String
+  resourceIdentifier String
+  // Failure-injection mode for deterministic testing.
+  // SUCCESS | TIMEOUT | FAIL_BEFORE_SIDE_EFFECT | FAIL_AFTER_SIDE_EFFECT
+  // | DUPLICATE | STALE_STATE | SLOW_SUCCESS
+  faultMode       String    @default("SUCCESS")
+  // Result of the command: success | failure | timeout | pending
+  result          String    @default("pending")
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
+
+  @@index([providerCode, resourceIdentifier])
 }

@@ -13,6 +13,9 @@ import type {
 export interface EvaluationInput {
   intent: ConnectivityIntentPayload;
   candidates: CandidateInput[];
+  // DETERMINISM: the caller passes an explicit evaluation time. The engine
+  // never calls new Date() / Date.now() internally.
+  evaluationTime: string; // ISO 8601
   currentSession?: {
     sessionId: string;
     resourceId: string;
@@ -22,6 +25,9 @@ export interface EvaluationInput {
     priceCents: number;
   };
 }
+
+// Exported for reproducibility: the weights used to score candidates.
+// (Defined after W below.) See SCORING_WEIGHTS export at bottom of file.
 
 export interface CandidateInput {
   resourceId: string;
@@ -94,12 +100,14 @@ function scoreCost(priceCents: number, budgetCents?: number): number {
 
 function effectiveMeasurement(c: CandidateInput): MeasurementSnapshot {
   // Observed measurement is truth; advertised is fallback only.
+  // DETERMINISM: the fallback does not call new Date() — scoring must be pure.
+  // The observedAt timestamp is informational only and never affects the score.
   return c.measurement ?? {
     latencyMs: c.advertised.typicalLatencyMs,
     downlinkMbps: c.advertised.maxDownlinkMbps,
     uplinkMbps: c.advertised.maxUplinkMbps,
     availabilityPct: c.advertised.availabilityPct,
-    observedAt: new Date().toISOString(),
+    observedAt: "1970-01-01T00:00:00.000Z", // sentinel for advertised fallback
     source: "advertised_fallback",
   };
 }
@@ -193,15 +201,9 @@ export function evaluate(input: EvaluationInput): DecisionResult {
     (s) => s.reasons.includes("AVAILABILITY_OK") && s.reasons.includes("ENTITLEMENT_VALID") && s.meetsPolicy
   );
 
-  const reasonCodes: ReasonCode[] = [];
-  if (viable.length === 0 && !currentSession) reasonCodes.push("NO_CANDIDATES");
-
-  let decision: DecisionResult["decisionType"];
-
   if (!currentSession) {
     // Fresh selection — pick the best viable candidate by effective score.
     if (viable.length === 0) {
-      decision = "RELEASE";
       return {
         decisionType: "RELEASE",
         reasonCodes: ["NO_CANDIDATES"],
@@ -277,3 +279,6 @@ export function evaluate(input: EvaluationInput): DecisionResult {
 }
 
 export const __scoring = { scoreLatency, scoreThroughput, scoreReliability, scoreCost, W, HYSTERESIS_THRESHOLD };
+
+// Reproducibility: the weights used to score candidates. Persisted with each Decision.
+export const SCORING_WEIGHTS = { ...W };

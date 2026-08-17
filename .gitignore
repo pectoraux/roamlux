@@ -25,6 +25,11 @@ db/
 dev.log
 server.log
 
+# sandbox / process artifacts — never commit
+*.pid
+.zscripts/
+redeploy-watcher.log
+
 # misc
 .DS_Store
 *.pem

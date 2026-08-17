@@ -7,7 +7,7 @@
 import { db } from "@/lib/db";
 import { hashPassword } from "@/lib/password";
 import { MOCK_PROFILES } from "@/domain/adapters/mock-providers";
-import type { Role } from "@prisma/client";
+import type { Role } from "@/domain/protocol";
 
 let bootstrapped = false;
 

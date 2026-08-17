@@ -3,7 +3,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { can, type Permission } from "@/lib/permissions";
 import { db } from "@/lib/db";
-import type { Role } from "@prisma/client";
+import type { Role } from "@/domain/protocol";
 
 export interface AuthContext {
   userId: string;
