@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireActiveUser } from "@/lib/server-auth";
-import { evaluate, type CandidateInput } from "@/domain/control-plane/decision-engine";
+import { evaluate, SCORING_WEIGHTS, type CandidateInput } from "@/domain/control-plane/decision-engine";
+import { capabilityMatches } from "@/domain/protocol";
 import type { AdvertisedCapability, MeasurementSnapshot } from "@/domain/protocol";
+import { verifyEntitlement } from "@/domain/entitlement/trial-policy";
 
 // POST /api/decisions { intentId }
 // Deterministically evaluates candidate capabilities/resources/offers against the intent
@@ -17,18 +19,17 @@ export async function POST(req: NextRequest) {
   const intent = await db.connectivityIntent.findUnique({ where: { id: body.intentId } });
   if (!intent || intent.subjectId !== ctx.userId) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // Discover candidate capabilities matching the intent's capability type.
-  // "internet" is a generic intent — matches all published connectivity types.
-  const capWhere = intent.capability === "internet"
-    ? { published: true }
-    : { published: true, type: intent.capability };
-  const capabilities = await db.capability.findMany({
-    where: capWhere,
+  // Discover candidate capabilities using the explicit capability taxonomy.
+  // "internet" is an abstract root that matches all concrete types — documented
+  // in protocol/capability.ts, not a scattered string comparison.
+  const allCapabilities = await db.capability.findMany({
+    where: { published: true },
     include: {
       provider: true,
       resources: { where: { state: { in: ["available", "active"] } }, include: { offers: { where: { valid: true } } } },
     },
   });
+  const capabilities = allCapabilities.filter((c) => capabilityMatches(intent.capability, c.type));
 
   // The user's active entitlements (determines entitlement-validity per candidate).
   const entitlements = await db.entitlement.findMany({
@@ -64,9 +65,10 @@ export async function POST(req: NextRequest) {
           observedAt: m.observedAt.toISOString(), source: m.source,
         };
       }
-      // Entitlement validity: an existing entitlement OR trial-eligibility (MVP policy:
-      // active users may receive a TRIAL-entitlement at activation — see ensureEntitlement).
-      const isEntitled = entitledOfferIds.has(offer.id) || true;
+      // Entitlement validity: ACTUAL entitlement check. No hardcoded bypass.
+      // A candidate is entitlement-valid only if the user holds an active entitlement
+      // for the offer. Trial entitlements may be granted explicitly via /api/entitlements.
+      const isEntitled = entitledOfferIds.has(offer.id);
       candidates.push({
         resourceId: res.id,
         providerId: cap.providerId,
@@ -97,12 +99,12 @@ export async function POST(req: NextRequest) {
       priceCents: offer?.priceCents ?? 0,
       measurement: undefined,
       available: true,
-      entitlementValid: true,
+      entitlementValid: true, // current session is already entitled by definition
     };
   }
 
   const intentPayload = {
-    capability: intent.capability as any,
+    capability: intent.capability,
     location: intent.location as any,
     timeWindow: intent.timeWindow as any,
     usage: intent.usage as any,
@@ -111,9 +113,11 @@ export async function POST(req: NextRequest) {
     policy: (intent.policy ?? undefined) as any,
   };
 
+  const evaluationTime = new Date().toISOString();
   const decision = evaluate({
     intent: intentPayload,
     candidates,
+    evaluationTime,
     currentSession: currentInput
       ? {
           sessionId: currentSession.id,
@@ -126,7 +130,9 @@ export async function POST(req: NextRequest) {
       : undefined,
   });
 
-  // Persist the decision.
+  // Persist the decision WITH REPRODUCIBILITY SNAPSHOTS.
+  // The future audit question "why did RoamLink make this decision?" is answerable
+  // from these stored snapshots without re-running the engine.
   const created = await db.decision.create({
     data: {
       intentId: intent.id,
@@ -141,6 +147,12 @@ export async function POST(req: NextRequest) {
       reasonCodes: decision.reasonCodes,
       policyMet: decision.policyMet,
       decidedBy: ctx.userId,
+      intentSnapshot: intentPayload as any,
+      policySnapshot: (intent.policy ?? intent.constraints) as any,
+      candidateSnapshot: decision.candidates as any,
+      measurementSnapshot: (currentInput?.measurement ?? {}) as any,
+      weightsSnapshot: SCORING_WEIGHTS as any,
+      evaluationTime: new Date(evaluationTime),
     },
   });
 

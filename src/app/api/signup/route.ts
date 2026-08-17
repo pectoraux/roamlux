@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { audit, emitEvent } from "@/lib/audit";
-import type { Role } from "@prisma/client";
+import type { Role } from "@/domain/protocol";
 import { z } from "zod";
 
 const ALLOWED_ROLES: Role[] = ["CONSUMER", "FAMILY_ADMIN", "ENTERPRISE_ADMIN", "PROVIDER", "RESELLER", "OPERATIONS"];

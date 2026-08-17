@@ -1,5 +1,6 @@
 // Role → Permission authorization model. Server-side enforced. Never email-based.
-import type { Role } from "@prisma/client";
+// Role is owned by the protocol (identity contract), not Prisma.
+import type { Role } from "@/domain/protocol";
 
 export type Permission =
   | "waitlist.view"

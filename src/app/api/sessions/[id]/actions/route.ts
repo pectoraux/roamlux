@@ -11,6 +11,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   try { body = await req.json(); } catch {}
   const action = String(body.action ?? "").toUpperCase() as ActionType;
   if (!ALLOWED.includes(action)) return NextResponse.json({ error: "Unsupported action" }, { status: 422 });
-  const res = await executeAction({ sessionId: id, action, subjectId: ctx.userId });
+  // Pass role so executeAction can enforce horizontal isolation (owner-or-admin).
+  const res = await executeAction({ sessionId: id, action, subjectId: ctx.userId, role: ctx.role });
+  if (res.error === "FORBIDDEN") return NextResponse.json(res, { status: 403 });
   return NextResponse.json(res, { status: res.ok ? 200 : 500 });
 }
